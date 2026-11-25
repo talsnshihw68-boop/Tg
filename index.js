@@ -27,17 +27,21 @@ const {
 const { Boom } = require('@hapi/boom');
 const pino = require('pino');
 
-// ─── Config ──────────────────────────────────────────────────────────────────
-const BOT_TOKEN  = process.env.BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN;
-const ADMIN_ID   = Number(process.env.ADMIN_ID || process.env.ADMIN_USER_ID || 0);
+// ─── Config ───────────────────────────────────────────────────────────────────
+const BOT_TOKEN = process.env.BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN;
+if (!BOT_TOKEN) { console.error('❌  BOT_TOKEN مفقود في .env'); process.exit(1); }
+
+const _adminRaw = process.env.ADMIN_ID || process.env.ADMIN_USER_ID;
+if (!_adminRaw) { console.error('❌  ADMIN_ID مفقود في .env'); process.exit(1); }
+const ADMIN_ID = Number(_adminRaw);
+if (Number.isNaN(ADMIN_ID)) { console.error('❌  ADMIN_ID ليس رقماً صالحاً.'); process.exit(1); }
 
 const CHECK_CONCURRENCY = Math.max(1, Number(process.env.CHECK_CONCURRENCY || 20));
 const CHECK_DELAY_MS    = Math.max(0, Number(process.env.CHECK_DELAY_MS    || 0));
 const SESSIONS_DIR      = path.resolve(process.env.SESSIONS_DIR || path.join(__dirname, 'sessions'));
-const BATCH_SIZE        = 500;
+const BATCH_SIZE        = 100;
+const MAX_COPY_BUTTONS  = 90;
 
-if (!BOT_TOKEN) { console.error('❌  BOT_TOKEN is required.'); process.exit(1); }
-if (!ADMIN_ID || Number.isNaN(ADMIN_ID)) { console.error('❌  ADMIN_ID is required.'); process.exit(1); }
 if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 
 function isAdmin(id) { return Number(id) === ADMIN_ID; }
@@ -46,6 +50,24 @@ const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 // ─── State ───────────────────────────────────────────────────────────────────
 const userStates      = new Map();
 const userFilePending = new Map();
+
+// ─── Known Users ─────────────────────────────────────────────────────────────
+const USERS_FILE = path.join(__dirname, 'users.json');
+let knownUsers = fs.existsSync(USERS_FILE)
+  ? JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'))
+  : {};
+function saveKnownUsers() { fs.writeFileSync(USERS_FILE, JSON.stringify(knownUsers, null, 2)); }
+function trackUser(userId, chatId, username) {
+  const key = String(userId);
+  if (!knownUsers[key]) {
+    knownUsers[key] = { chatId, username: username || null, firstSeen: Date.now(), lastSeen: Date.now() };
+  } else {
+    knownUsers[key].chatId = chatId;
+    if (username) knownUsers[key].username = username;
+    knownUsers[key].lastSeen = Date.now();
+  }
+  saveKnownUsers();
+}
 
 // ─── Banned Users ─────────────────────────────────────────────────────────────
 const BANNED_FILE = path.join(__dirname, 'banned.json');
@@ -97,8 +119,7 @@ function useCode(code, userId) {
 }
 function deleteCode(code) { delete inviteCodes[code?.toUpperCase()]; saveCodes(); }
 
-// ─── Share Keys (Shared Session Codes) ───────────────────────────────────────
-// shareKeys: { CODE: { ownerUserId, maxUses, uses, note, createdAt } }
+// ─── Share Keys ───────────────────────────────────────────────────────────────
 const SHARE_FILE = path.join(__dirname, 'share_keys.json');
 let shareKeys = fs.existsSync(SHARE_FILE) ? JSON.parse(fs.readFileSync(SHARE_FILE, 'utf8')) : {};
 function saveShareKeys() { fs.writeFileSync(SHARE_FILE, JSON.stringify(shareKeys, null, 2)); }
@@ -119,7 +140,6 @@ function useShareKey(code) {
 }
 function deleteShareKey(code) { delete shareKeys[code?.toUpperCase()]; saveShareKeys(); }
 
-// userShareMap: userId → ownerUserId (which session to borrow)
 const USER_SHARE_MAP_FILE = path.join(__dirname, 'user_share_map.json');
 let userShareMap = fs.existsSync(USER_SHARE_MAP_FILE)
   ? JSON.parse(fs.readFileSync(USER_SHARE_MAP_FILE, 'utf8'))
@@ -142,21 +162,11 @@ function getState(userId) {
       pairingRequested: false, pairingCode: null,
       chatId: null, info: null, connectedAt: null, authenticatedAt: null,
       lastDisconnectReason: null, lastError: null, userId,
-      telegramUser: null, privateChatId: null,
-      welcomeInProgress: false,
+      username: null, lastPremiumUnused: [], lastConcatList: [],
       checks: { totalChecked: 0, registered: 0, unregistered: 0, errors: 0 },
     });
   }
   return userStates.get(userId);
-}
-function updateTelegramProfile(state, user, chat) {
-  if (!state || !user) return;
-  state.telegramUser = {
-    firstName: user.first_name || '',
-    lastName: user.last_name || '',
-    username: user.username || '',
-  };
-  if (chat?.type === 'private') state.privateChatId = chat.id;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -204,8 +214,12 @@ function downloadUrl(url) {
   return new Promise((resolve, reject) => {
     const mod = url.startsWith('https') ? https : http;
     mod.get(url, res => {
-      const ch = [];
-      res.on('data', c => ch.push(c));
+      const ch = []; let size = 0;
+      res.on('data', c => {
+        size += c.length;
+        if (size > 6 * 1024 * 1024) { res.destroy(); reject(new Error('الملف كبير')); return; }
+        ch.push(c);
+      });
       res.on('end', () => resolve(Buffer.concat(ch).toString('utf-8')));
       res.on('error', reject);
     }).on('error', reject);
@@ -270,6 +284,38 @@ function groupBySubPrefix(numbers) {
   return groups;
 }
 
+// ─── Premium Number Detection (3+ أرقام متكررة) ──────────────────────────────
+function isPremiumNumber(num) {
+  const s = stripCountryCode(num);
+  if (s.length < 4) return false;
+  if (/(.)\1{2,}/.test(s)) return true;
+  if (/^(.{2,3})\1+$/.test(s)) return true;
+  let asc = true, desc = true;
+  for (let i = 1; i < s.length; i++) {
+    if (+s[i] - +s[i - 1] !== 1) asc = false;
+    if (+s[i - 1] - +s[i] !== 1) desc = false;
+  }
+  if (asc || desc) return true;
+  if (s === s.split('').reverse().join('')) return true;
+  return false;
+}
+
+// ─── Concat Plus Numbers Detection (ميزة فصل الأرقام بـ +) ──────────────────
+function isConcatPlusNumbers(text) {
+  const trimmed = text.trim();
+  const plusCount = (trimmed.match(/\+/g) || []).length;
+  if (plusCount < 2) return false;
+  if (/\n/.test(trimmed)) return false;
+  const parts = trimmed.split('+').map(p => p.trim()).filter(p => p);
+  if (parts.length < 2) return false;
+  return parts.every(p => /^\d{7,15}$/.test(p));
+}
+
+function extractConcatPlusNumbers(text) {
+  const parts = text.trim().split('+').map(p => p.trim()).filter(p => p);
+  return parts.map(p => '+' + p);
+}
+
 // ─── Session Destroy ──────────────────────────────────────────────────────────
 async function destroyClient(state) {
   const sock = state.sock;
@@ -294,7 +340,7 @@ function mainMenuKeyboard(userId) {
     [{ text: '❓ مساعدة', callback_data: 'menu_help' }],
   ];
   if (isAdmin(userId)) {
-    rows.push([{ text: '📢 رسالة جماعية', callback_data: 'menu_broadcast' }]);
+    rows.push([{ text: '📢 رسالة جماعية لجميع المستخدمين', callback_data: 'menu_broadcast' }]);
     rows.push([
       { text: '👥 المستخدمون', callback_data: 'menu_users' },
       { text: '🎟️ أكواد الدعوة', callback_data: 'menu_codes' },
@@ -327,16 +373,25 @@ function statusKeyboard(state) {
   rows.push([{ text: '🔙 رجوع', callback_data: 'back_main' }]);
   return { inline_keyboard: rows };
 }
-function afterCheckKeyboard(userId, totalChecked, hasPending) {
-  const rows = [];
-  if (hasPending) rows.push([{ text: `↩️ رجوع للقائمة (فحصت: ${totalChecked})`, callback_data: 'menu_file_list' }]);
-  rows.push([
-    { text: totalChecked > 0 ? `🔢 فحص أخرى (${totalChecked})` : '🔢 فحص أخرى', callback_data: 'menu_check' },
-    { text: '📊 الحالة', callback_data: 'menu_status' },
-  ]);
-  rows.push([{ text: '🏠 الرئيسية', callback_data: 'back_main' }]);
-  return { inline_keyboard: rows };
+
+function buildResultKeyboard(userId, prefix) {
+  let row1 = [];
+  if (prefix === 'premium') {
+    row1.push({ text: `🔁 جولة جديدة (مميزة)`, callback_data: 'check_all_premium' });
+  } else if (prefix) {
+    row1.push({ text: `🔁 جولة جديدة (${prefix})`, callback_data: `subpfx:${prefix}` });
+  } else {
+    row1.push({ text: `🔢 فحص أخرى`, callback_data: 'menu_check' });
+  }
+  row1.push({ text: `📋 قائمة البادئات`, callback_data: 'menu_file_list' });
+  
+  const row2 = [
+    { text: `⭐ استخراج المميزة`, callback_data: `extract_premium:${userId}` },
+    { text: '🏠 الرئيسية', callback_data: 'back_main' }
+  ];
+  return { inline_keyboard: [row1, row2] };
 }
+
 function buildPrefixMarkup(parentGroups, checked) {
   const btns = Object.keys(parentGroups).sort().map(p => {
     const total = parentGroups[p].length;
@@ -346,6 +401,8 @@ function buildPrefixMarkup(parentGroups, checked) {
   });
   const rows = [];
   for (let i = 0; i < btns.length; i += 4) rows.push(btns.slice(i, i + 4));
+  
+  rows.push([{ text: '⭐ استخراج وفحص الأرقام المميزة بالكامل', callback_data: 'check_all_premium' }]);
   rows.push([{ text: '🔙 رجوع', callback_data: 'back_main' }]);
   return { inline_keyboard: rows };
 }
@@ -368,23 +425,6 @@ async function showMain(chatId, state) {
   state.screen = 'main';
   await bot.sendMessage(chatId, `👋 <b>القائمة الرئيسية</b>\n\nالحالة: ${statusLabel(state)}`,
     { parse_mode: 'HTML', reply_markup: mainMenuKeyboard(state.userId) });
-}
-async function showStartWelcome(chatId, state) {
-  if (state.welcomeInProgress) return;
-  state.welcomeInProgress = true;
-  try {
-    const greeting = await bot.sendMessage(
-      chatId,
-      '🎉💍 يا هلا ومرحبا، نورت البوت! حضورك فرحة 🎊🥳'
-    );
-    await new Promise(resolve => setTimeout(resolve, 3000));
-    await bot.deleteMessage(chatId, greeting.message_id).catch(() => {});
-  } catch (_) {
-    // Continue to the main screen even if the temporary greeting cannot be sent.
-  } finally {
-    state.welcomeInProgress = false;
-  }
-  await showMain(chatId, state);
 }
 async function showLinkMenu(chatId, state) {
   state.screen = 'link';
@@ -412,7 +452,7 @@ async function showStatus(chatId, state) {
   const c = state.checks;
   if (c?.totalChecked > 0) {
     lines.push('', `📈 <b>إحصائيات الفحص</b>`);
-    lines.push(`• إجمالي: ${c.totalChecked} | ✅ ${c.registered} | ❌ ${c.unregistered} | ⚠️ ${c.errors}`);
+    lines.push(`• إجمالي: ${c.totalChecked} | ⭐ ${c.registered} | ❌ ${c.unregistered} | ⚠️ ${c.errors}`);
   }
   if (state.status === 'pairing_pending' && state.pairingCode)
     lines.push('', `🔑 رمز الربط: <code>${escapeHtml(state.pairingCode)}</code>`);
@@ -425,10 +465,13 @@ async function showHelp(chatId, state) {
     '📖 <b>طريقة الاستخدام</b>\n\n' +
     '1) اضغط «🔗 ربط الحساب» واختر QR أو رقم الهاتف.\n' +
     '2) بعد الربط أرسل ملف .txt/.csv مباشرة.\n' +
-    '3) كل ضغطة = 100 رقم عشوائي من البادئة المختارة.\n' +
-    '4) النتائج: ✅ المسجلة أولًا ثم ❌ غير المسجلة.\n\n' +
+    '3) كل ضغطة = حتى 100 رقم عشوائي من البادئة المختارة.\n' +
+    '4) النتائج: ✅ مستخدمة — ⭐ مميزة غير مستخدمة — ❌ عادية غير مستخدمة.\n\n' +
+    '💡 <b>ميزة فصل الأرقام:</b>\n' +
+    'أرسل أرقاماً متلاصقة بصيغة: <code>+9677XXXXXXX+9677XXXXXXX</code>\n' +
+    'وسيتم إرجاعها كقائمة منظمة مع زر للفحص.\n\n' +
     '• «♻️ استعادة الجلسة» تُعيد الاتصال بجلسة محفوظة.' +
-    (isAdmin(state.userId) ? '\n• 👥 «المستخدمون» — إدارة الجلسات.' : ''),
+    (isAdmin(state.userId) ? '\n• 👥 «المستخدمون» — إدارة الجلسات.\n• 📢 «رسالة جماعية» — إرسال لجميع المستخدمين المسجلين.' : ''),
     { parse_mode: 'HTML', reply_markup: backKeyboard() });
 }
 async function promptCheck(chatId, state) {
@@ -456,13 +499,6 @@ async function promptPhone(chatId, state) {
 }
 
 // ─── Admin ────────────────────────────────────────────────────────────────────
-function telegramProfileUrl(userId, profile = {}) {
-  const username = String(profile.username || '').trim().replace(/^@/, '');
-  if (/^[A-Za-z0-9_]{5,32}$/.test(username)) return `https://t.me/${username}`;
-  const id = Number(userId);
-  return Number.isSafeInteger(id) && id > 0 ? `tg://user?id=${id}` : null;
-}
-
 async function showAdminUsers(chatId) {
   const active = [...userStates.entries()].filter(([, s]) => s.sock || s.status === 'ready');
   if (active.length === 0) {
@@ -473,11 +509,11 @@ async function showAdminUsers(chatId) {
   const rows = [];
   for (const [uid, s] of active) {
     const banned = isBanned(uid);
-    const privateUrl = telegramProfileUrl(uid, s.telegramUser || {});
-    lines.push(`• <code>${uid}</code> — ${escapeHtml(s.info?.name || '—')} | 📞 ${s.info?.phone || '—'} | ${statusLabel(s)}${banned ? ' | 🚫 محظور' : ''}`);
+    const uname  = s.username ? `@${s.username}` : '—';
+    lines.push(`• <code>${uid}</code> (${escapeHtml(uname)}) — ${escapeHtml(s.info?.name || '—')} | 📞 ${s.info?.phone || '—'} | ${statusLabel(s)}${banned ? ' | 🚫 محظور' : ''}`);
     rows.push([
       { text: `👤 ${s.info?.name || uid}`, callback_data: `admin_info_${uid}` },
-      { text: '💬 فتح الخاص', ...(privateUrl ? { url: privateUrl } : { callback_data: `admin_dm_${uid}` }) },
+      { text: '✉️ مراسلة', callback_data: `admin_dm_${uid}` },
       { text: '🔌 استخدام', callback_data: `admin_use_${uid}` },
     ]);
     rows.push([
@@ -542,35 +578,11 @@ async function adminKickUser(chatId, targetUserId) {
   if (!state) { await bot.sendMessage(chatId, '⚠️ المستخدم غير موجود.'); return; }
   const name = state.info?.name || targetUserId;
   await destroyClient(state);
-  if (state.privateChatId) {
-    try { await bot.sendMessage(state.privateChatId, '⚠️ تم إنهاء جلستك من قِبَل الأدمن.', { reply_markup: mainMenuKeyboard(Number(targetUserId)) }); } catch (_) {}
+  userFilePending.delete(Number(targetUserId));
+  if (state.chatId) {
+    try { await bot.sendMessage(state.chatId, '⚠️ تم إنهاء جلستك من قِبَل الأدمن.', { reply_markup: mainMenuKeyboard(Number(targetUserId)) }); } catch (_) {}
   }
   await bot.sendMessage(chatId, `✅ تم طرد ${escapeHtml(String(name))}.`, { reply_markup: backKeyboard() });
-}
-
-async function notifyAdminOfCheck(userId, total) {
-  if (!ADMIN_ID || !userId || isAdmin(userId)) return;
-  const profile = userStates.get(Number(userId))?.telegramUser || {};
-  const name = [profile.firstName, profile.lastName].filter(Boolean).join(' ') || 'اسم غير متاح';
-  const username = profile.username ? `@${escapeHtml(profile.username)}` : 'غير متاح';
-  const message =
-    `🔎 <b>بدأ مستخدم فحصًا</b>\n\n` +
-    `👤 الاسم: ${escapeHtml(name)}\n` +
-    `🔗 المستخدم: ${username}\n` +
-    `🆔 المعرّف: <code>${Number(userId)}</code>\n` +
-    `📦 عدد الأرقام في هذه العملية: <b>${Number(total) || 0}</b>`;
-  try {
-    const privateUrl = telegramProfileUrl(userId, profile);
-    await bot.sendMessage(ADMIN_ID, message, {
-      parse_mode: 'HTML',
-      reply_markup: { inline_keyboard: [[
-        { text: '💬 فتح الخاص', ...(privateUrl ? { url: privateUrl } : { callback_data: `admin_dm_${Number(userId)}` }) },
-        { text: '🚫 حظر', callback_data: `admin_ban_${Number(userId)}` },
-      ]] },
-    });
-  } catch (_) {
-    // A notification failure must not interrupt the user's check.
-  }
 }
 
 // ─── WhatsApp via Baileys ─────────────────────────────────────────────────────
@@ -586,7 +598,6 @@ async function startSession(userId, chatId, method, phoneNumber) {
   try {
     const sessionPath = path.join(SESSIONS_DIR, `session-${userId}`);
 
-    // عند ربط جديد (phone أو qr) — احذف الجلسة القديمة لتجنب خطأ "تسجيل الخروج"
     if (method === 'phone' || method === 'qr') {
       try { fs.rmSync(sessionPath, { recursive: true, force: true }); } catch (_) {}
     }
@@ -619,7 +630,6 @@ async function startSession(userId, chatId, method, phoneNumber) {
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
 
-      // ── QR or Pairing Code ──
       if (qr) {
         if (method === 'qr') {
           state.status = 'qr_pending';
@@ -660,7 +670,6 @@ async function startSession(userId, chatId, method, phoneNumber) {
         }
       }
 
-      // ── Connected ──
       if (connection === 'open') {
         state.status = 'ready';
         state.connectedAt = Date.now();
@@ -681,11 +690,21 @@ async function startSession(userId, chatId, method, phoneNumber) {
 
         if (!isAdmin(userId) && ADMIN_ID) {
           try {
+            let tgUsername = state.username ? `@${state.username}` : null;
+            if (!tgUsername) {
+              try {
+                const chatInfo = await bot.getChat(userId);
+                if (chatInfo?.username) tgUsername = `@${chatInfo.username}`;
+              } catch (_) {}
+            }
+            tgUsername = tgUsername || '—';
+
             await bot.sendMessage(ADMIN_ID,
               `🔔 <b>مستخدم جديد ربط جلسة</b>\n\n` +
-              `🆔 Telegram ID: <code>${userId}</code>\n` +
-              `👤 الاسم: ${escapeHtml(info?.name || '—')}\n` +
-              `📞 الرقم: <code>${info?.phone || '—'}</code>\n` +
+              `👤 يوزر التلجرام: ${escapeHtml(tgUsername)}\n` +
+              `🆔 ID: <code>${userId}</code>\n` +
+              `📛 اسم واتساب: ${escapeHtml(info?.name || '—')}\n` +
+              `📞 رقم واتساب: <code>${info?.phone || '—'}</code>\n` +
               `📅 وقت الربط: ${escapeHtml(formatDateTime(Date.now()))}`,
               {
                 parse_mode: 'HTML',
@@ -698,7 +717,6 @@ async function startSession(userId, chatId, method, phoneNumber) {
         }
       }
 
-      // ── Disconnected ──
       if (connection === 'close') {
         const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
         const loggedOut  = statusCode === DisconnectReason.loggedOut;
@@ -747,6 +765,7 @@ async function handleLogout(userId, chatId) {
   state.info = null; state.connectedAt = null; state.authenticatedAt = null;
   state.method = null; state.lastError = null; state.lastDisconnectReason = null;
   state.checks = { totalChecked: 0, registered: 0, unregistered: 0, errors: 0 };
+  userFilePending.delete(userId);
   await bot.sendMessage(chatId, '✅ تم تسجيل الخروج وحذف الجلسة.', { reply_markup: mainMenuKeyboard(userId) });
 }
 
@@ -767,12 +786,12 @@ async function fetchFileNumbers(fileId) {
 }
 
 // ─── Commands ─────────────────────────────────────────────────────────────────
-bot.onText(/^\/start\b/,   async msg => { const s = getState(msg.from.id); s.userId = msg.from.id; await showStartWelcome(msg.chat.id, s); });
-bot.onText(/^\/help\b/,    async msg => { const s = getState(msg.from.id); s.userId = msg.from.id; await showHelp(msg.chat.id, s); });
-bot.onText(/^\/link\b/,    async msg => { const s = getState(msg.from.id); s.userId = msg.from.id; if (!isAuthorized(s.userId)) { await promptInviteCode(msg.chat.id, s); return; } await showLinkMenu(msg.chat.id, s); });
-bot.onText(/^\/check\b/,   async msg => { const s = getState(msg.from.id); s.userId = msg.from.id; if (!isAuthorized(s.userId)) { await promptInviteCode(msg.chat.id, s); return; } await promptCheck(msg.chat.id, s); });
-bot.onText(/^\/status\b/,  async msg => { const s = getState(msg.from.id); s.userId = msg.from.id; if (!isAuthorized(s.userId)) { await promptInviteCode(msg.chat.id, s); return; } await showStatus(msg.chat.id, s); });
-bot.onText(/^\/restore\b/, async msg => { const s = getState(msg.from.id); s.userId = msg.from.id; if (!isAuthorized(s.userId)) { await promptInviteCode(msg.chat.id, s); return; } await restoreSession(msg.from.id, msg.chat.id); });
+bot.onText(/^\/start\b/,   async msg => { const s = getState(msg.from.id); s.userId = msg.from.id; if (msg.from.username) s.username = msg.from.username; trackUser(msg.from.id, msg.chat.id, msg.from.username); await showMain(msg.chat.id, s); });
+bot.onText(/^\/help\b/,    async msg => { const s = getState(msg.from.id); s.userId = msg.from.id; if (msg.from.username) s.username = msg.from.username; trackUser(msg.from.id, msg.chat.id, msg.from.username); await showHelp(msg.chat.id, s); });
+bot.onText(/^\/link\b/,    async msg => { const s = getState(msg.from.id); s.userId = msg.from.id; if (msg.from.username) s.username = msg.from.username; trackUser(msg.from.id, msg.chat.id, msg.from.username); if (!isAuthorized(s.userId)) { await promptInviteCode(msg.chat.id, s); return; } await showLinkMenu(msg.chat.id, s); });
+bot.onText(/^\/check\b/,   async msg => { const s = getState(msg.from.id); s.userId = msg.from.id; if (msg.from.username) s.username = msg.from.username; trackUser(msg.from.id, msg.chat.id, msg.from.username); if (!isAuthorized(s.userId)) { await promptInviteCode(msg.chat.id, s); return; } await promptCheck(msg.chat.id, s); });
+bot.onText(/^\/status\b/,  async msg => { const s = getState(msg.from.id); s.userId = msg.from.id; if (msg.from.username) s.username = msg.from.username; trackUser(msg.from.id, msg.chat.id, msg.from.username); if (!isAuthorized(s.userId)) { await promptInviteCode(msg.chat.id, s); return; } await showStatus(msg.chat.id, s); });
+bot.onText(/^\/restore\b/, async msg => { const s = getState(msg.from.id); s.userId = msg.from.id; if (msg.from.username) s.username = msg.from.username; trackUser(msg.from.id, msg.chat.id, msg.from.username); if (!isAuthorized(s.userId)) { await promptInviteCode(msg.chat.id, s); return; } await restoreSession(msg.from.id, msg.chat.id); });
 bot.onText(/^\/logout\b/,  async msg => {
   if (!isAdmin(msg.from.id)) { await bot.sendMessage(msg.chat.id, '⛔ للأدمن فقط.'); return; }
   await handleLogout(msg.from.id, msg.chat.id);
@@ -808,25 +827,31 @@ bot.onText(/^\/broadcast\b/, async msg => {
 });
 
 async function sendBroadcast(chatId, text) {
-  const allUsers = [...userStates.entries()];
-  const targets = allUsers.filter(([uid]) => Number(uid) !== ADMIN_ID);
+  const all = new Set(Object.keys(knownUsers));
+  for (const [uid] of userStates) all.add(String(uid));
+
+  const targets = [...all].filter(uid => Number(uid) !== ADMIN_ID);
   if (targets.length === 0) {
-    await bot.sendMessage(chatId, '⚠️ لا يوجد مستخدمون حالياً.');
+    await bot.sendMessage(chatId, '⚠️ لا يوجد مستخدمون مسجلون حالياً.');
     return;
   }
+
   const progress = await bot.sendMessage(chatId, `📤 جاري الإرسال لـ ${targets.length} مستخدم...`);
   let success = 0, failed = 0;
-  for (const [uid, s] of targets) {
+
+  for (const uid of targets) {
+    const targetChatId = knownUsers[uid]?.chatId || userStates.get(Number(uid))?.chatId || Number(uid);
     try {
-      const dest = s.chatId || Number(uid);
-      await bot.sendMessage(dest,
+      await bot.sendMessage(targetChatId,
         `📢 <b>رسالة من الأدمن</b>\n\n${escapeHtml(text)}`,
         { parse_mode: 'HTML' });
       success++;
+      await new Promise(r => setTimeout(r, 50));
     } catch (_) { failed++; }
   }
+
   await bot.editMessageText(
-    `✅ <b>تم الإرسال</b>\n\n• وصلت: ${success}\n• فشلت: ${failed}`,
+    `✅ <b>تم الإرسال</b>\n\n• وصلت: ${success}\n• فشلت: ${failed}\n• الإجمالي: ${targets.length}`,
     { chat_id: chatId, message_id: progress.message_id, parse_mode: 'HTML' }
   ).catch(async () => {
     await bot.sendMessage(chatId, `✅ وصلت: ${success} | فشلت: ${failed}`);
@@ -839,13 +864,112 @@ bot.on('callback_query', async q => {
   const userId = q.from.id;
   const state  = getState(userId);
   state.userId = userId;
-  updateTelegramProfile(state, q.from, q.message.chat);
+  if (q.from.username) state.username = q.from.username;
+  trackUser(userId, chatId, q.from.username);
   try {
     await bot.answerCallbackQuery(q.id).catch(() => {});
 
-    // Auth gate for callbacks — block unauthorized users from all actions
     if (!isAuthorized(userId)) {
       await promptInviteCode(chatId, state);
+      return;
+    }
+
+    // ✅ فحص الأرقام المفصولة (الميزة الجديدة)
+    if (q.data === 'check_concat_list') {
+      const list = state.lastConcatList || [];
+      if (list.length === 0) {
+        await bot.sendMessage(chatId, '⚠️ لا توجد أرقام محفوظة. أعد إرسال الأرقام المتلاصقة.');
+        return;
+      }
+      
+      const effectiveState = (state.status === 'ready' && state.sock) ? state : getUserSharedSock(userId);
+      if (!effectiveState) {
+        await bot.sendMessage(chatId, '⚠️ يجب الربط أولاً أو الحصول على كود مشاركة جلسة.',
+          { reply_markup: mainMenuKeyboard(userId) });
+        return;
+      }
+      
+      const cleaned = list.map(n => cleanNumber(n)).filter(n => n.length >= 7);
+      if (cleaned.length === 0) {
+        await bot.sendMessage(chatId, '⚠️ لا توجد أرقام صالحة للفحص.');
+        return;
+      }
+      
+      const toCheck = cleaned.slice(0, BATCH_SIZE);
+      if (cleaned.length > BATCH_SIZE) {
+        await bot.sendMessage(chatId, `⚠️ سيتم فحص أول ${BATCH_SIZE} رقم فقط من أصل ${cleaned.length}.`);
+      }
+      
+      await checkNumbers(effectiveState, chatId, toCheck, userId, null);
+      return;
+    }
+
+    // زر استخراج المميزة من آخر جولة
+    if (q.data.startsWith('extract_premium:')) {
+      const targetId = Number(q.data.replace('extract_premium:', ''));
+      const tState = getState(targetId);
+      const premium = tState.lastPremiumUnused || [];
+      
+      if (premium.length === 0) {
+        await bot.sendMessage(chatId, '⚠️ لا توجد أرقام مميزة غير مستخدمة في الجولة الأخيرة.');
+        return;
+      }
+      
+      const nums = premium.slice(0, MAX_COPY_BUTTONS).map(n => stripCountryCode(n));
+      const rows = [];
+      for (let i = 0; i < nums.length; i += 3) {
+        rows.push(nums.slice(i, i + 3).map(n => ({ text: `⭐ ${n}`, copy_text: { text: n } })));
+      }
+      const extra = premium.length > MAX_COPY_BUTTONS ? `\n<i>(يُعرض أول ${MAX_COPY_BUTTONS} زر)</i>` : '';
+      
+      await bot.sendMessage(chatId, 
+        `⭐ <b>الأرقام المميزة غير المستخدمة من الجولة الأخيرة (${premium.length}):</b>${extra}`, 
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } });
+      return;
+    }
+
+    // زر فحص كل المميزة من الملف
+    if (q.data === 'check_all_premium') {
+      const pending = userFilePending.get(userId);
+      if (!pending || !pending.allNumbers) {
+        await bot.sendMessage(chatId, '⚠️ لا يوجد ملف محمّل.');
+        return;
+      }
+      
+      const allChecked = new Set();
+      for (const set of Object.values(pending.checked)) {
+        for (const n of set) allChecked.add(n);
+      }
+      
+      const premiums = pending.allNumbers.filter(n => isPremiumNumber(n) && !allChecked.has(n));
+      
+      if (premiums.length === 0) {
+        await bot.sendMessage(chatId, '⚠️ لا توجد أرقام مميزة غير مفحوصة في هذا الملف.');
+        return;
+      }
+      
+      const picked = premiums.slice(0, BATCH_SIZE);
+      await bot.sendMessage(chatId, `⭐ تم العثور على ${premiums.length} رقم مميز. جاري فحص أول ${picked.length}...`);
+      
+      const effectiveState = pending.effectiveState || ((state.status === 'ready' && state.sock) ? state : getUserSharedSock(userId));
+      if (!effectiveState) {
+        await bot.sendMessage(chatId, '⚠️ الجلسة غير مربوطة.');
+        return;
+      }
+      
+      const result = await checkNumbers(effectiveState, chatId, picked, userId, 'premium');
+      
+      for (const n of result.registered) {
+        const p = stripCountryCode(n).slice(0, 2);
+        if (!pending.checked[p]) pending.checked[p] = new Set();
+        pending.checked[p].add(n);
+      }
+      for (const n of result.unregistered) {
+        const p = stripCountryCode(n).slice(0, 2);
+        if (!pending.checked[p]) pending.checked[p] = new Set();
+        pending.checked[p].add(n);
+      }
+      
       return;
     }
 
@@ -906,13 +1030,11 @@ bot.on('callback_query', async q => {
       if (!isAdmin(userId)) return;
       const tid = q.data.replace('admin_dm_', '');
       const ts  = userStates.get(Number(tid));
-      const profile = ts?.telegramUser || {};
-      const name = [profile.firstName, profile.lastName].filter(Boolean).join(' ') || profile.username || tid;
+      const name = ts?.info?.name || tid;
+      state.screen = `awaiting_dm_${tid}`;
       await bot.sendMessage(chatId,
-        `💬 <b>فتح محادثة ${escapeHtml(name)}</b>`,
-        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[
-          { text: '💬 فتح الخاص', url: telegramProfileUrl(tid, profile) || `tg://user?id=${Number(tid)}` },
-        ]] } });
+        `✉️ <b>مراسلة ${escapeHtml(name)}</b>\n\nأرسل الرسالة التي تريد إيصالها له:`,
+        { parse_mode: 'HTML', reply_markup: backKeyboard() });
       return;
     }
 
@@ -939,8 +1061,8 @@ bot.on('callback_query', async q => {
       const tid = Number(q.data.replace('admin_ban_', ''));
       banUser(tid);
       const ts = userStates.get(tid);
-      if (ts?.privateChatId) {
-        try { await bot.sendMessage(ts.privateChatId, '🚫 تم حظرك من استخدام بوت الفحص. تواصل مع الأدمن لرفع الحظر.'); } catch (_) {}
+      if (ts?.chatId) {
+        try { await bot.sendMessage(ts.chatId, '🚫 تم حظرك من استخدام بوت الفحص. تواصل مع الأدمن لرفع الحظر.'); } catch (_) {}
       }
       await bot.sendMessage(chatId, `🚫 تم حظر المستخدم <code>${tid}</code> من الفحص.`, { parse_mode: 'HTML', reply_markup: backKeyboard() });
       return;
@@ -950,8 +1072,8 @@ bot.on('callback_query', async q => {
       const tid = Number(q.data.replace('admin_unban_', ''));
       unbanUser(tid);
       const ts = userStates.get(tid);
-      if (ts?.privateChatId) {
-        try { await bot.sendMessage(ts.privateChatId, '✅ تم رفع الحظر عنك. يمكنك الآن استخدام الفحص.'); } catch (_) {}
+      if (ts?.chatId) {
+        try { await bot.sendMessage(ts.chatId, '✅ تم رفع الحظر عنك. يمكنك الآن استخدام الفحص.'); } catch (_) {}
       }
       await bot.sendMessage(chatId, `✅ تم رفع الحظر عن المستخدم <code>${tid}</code>.`, { parse_mode: 'HTML', reply_markup: backKeyboard() });
       return;
@@ -961,8 +1083,9 @@ bot.on('callback_query', async q => {
       const tid = Number(q.data.replace('admin_info_', ''));
       const ts  = userStates.get(tid);
       if (!ts) { await bot.sendMessage(chatId, '⚠️ لا يوجد بيانات.'); return; }
+      const uname = ts.username ? `@${ts.username}` : '—';
       await bot.sendMessage(chatId,
-        `👤 <b>معلومات المستخدم</b>\n• ID: <code>${tid}</code>\n• الاسم: ${escapeHtml(ts.info?.name || '—')}\n• الرقم: <code>${ts.info?.phone || '—'}</code>\n• الحالة: ${statusLabel(ts)}\n• فحص: ${ts.checks.totalChecked} (✅${ts.checks.registered} ❌${ts.checks.unregistered})`,
+        `👤 <b>معلومات المستخدم</b>\n• ID: <code>${tid}</code>\n• يوزر التلجرام: ${escapeHtml(uname)}\n• اسم واتساب: ${escapeHtml(ts.info?.name || '—')}\n• الرقم: <code>${ts.info?.phone || '—'}</code>\n• الحالة: ${statusLabel(ts)}\n• فحص: ${ts.checks.totalChecked} (⭐${ts.checks.registered} ❌${ts.checks.unregistered})`,
         { parse_mode: 'HTML', reply_markup: { inline_keyboard: [
           [{ text: '🔌 استخدام', callback_data: `admin_use_${tid}` }, { text: '🚪 طرد', callback_data: `admin_kick_${tid}` }],
           [{ text: '🔙 رجوع', callback_data: 'menu_users' }],
@@ -1021,18 +1144,24 @@ bot.on('callback_query', async q => {
         await bot.answerCallbackQuery(q.id, { text: '✅ تم فحص جميع أرقام هذه البادئة!', show_alert: true });
         return;
       }
-      const picked   = shuffle(remaining).slice(0, 100);
-      for (const n of picked) checkedSet.add(n);
-      const leftAfter = remaining.length - picked.length;
-      const totalDone = Object.values(pending.checked).reduce((s, st) => s + st.size, 0);
-      await bot.sendMessage(chatId, `🎲 بادئة <b>${prefix}</b> | 📦 ${picked.length} رقم | 🔁 متبقٍ: ${leftAfter}`, { parse_mode: 'HTML' });
-      await checkNumbers(subEffective, chatId, picked, userId);
-      const afterRows = [];
-      if (leftAfter > 0) afterRows.push([{ text: `🔁 جولة جديدة من ${prefix} (${leftAfter} متبقٍ)`, callback_data: `subpfx:${prefix}` }]);
-      afterRows.push([{ text: `↩️ رجوع لـ ${parent}`, callback_data: `pfx:${parent}` }]);
-      afterRows.push([{ text: `📋 قائمة البادئات (${totalDone})`, callback_data: 'menu_file_list' }]);
-      afterRows.push([{ text: '🏠 الرئيسية', callback_data: 'back_main' }]);
-      await bot.sendMessage(chatId, '▸ اختر الإجراء التالي:', { reply_markup: { inline_keyboard: afterRows } });
+
+      const picked = shuffle(remaining).slice(0, BATCH_SIZE);
+      await bot.sendMessage(chatId,
+        `🎲 بادئة <b>${prefix}</b> | 📦 فحص ${picked.length} رقم من أصل ${remaining.length} متبقٍ`,
+        { parse_mode: 'HTML' });
+
+      const result = await checkNumbers(subEffective, chatId, picked, userId, prefix);
+
+      for (const n of result.registered)   checkedSet.add(n);
+      for (const n of result.unregistered) checkedSet.add(n);
+
+      const actuallyChecked = result.registered.length + result.unregistered.length;
+
+      if (actuallyChecked === 0 && result.errors.length > 0) {
+        await bot.sendMessage(chatId,
+          `⚠️ جميع الأرقام (${result.errors.length}) فشلت — الجلسة قد تكون غير مستقرة. حاول لاحقاً أو بدّل البادئة.`,
+          { parse_mode: 'HTML' });
+      }
       return;
     }
 
@@ -1055,7 +1184,7 @@ bot.on('callback_query', async q => {
         if (!isAdmin(userId)) { await bot.sendMessage(chatId, '⛔ للأدمن فقط.'); break; }
         state.screen = 'awaiting_broadcast';
         await bot.sendMessage(chatId,
-          '📢 <b>رسالة جماعية</b>\n\nاكتب الرسالة التي تريد إرسالها لجميع المستخدمين:',
+          '📢 <b>رسالة جماعية</b>\n\nاكتب الرسالة التي تريد إرسالها لجميع المستخدمين المسجلين في البوت:',
           { parse_mode: 'HTML', reply_markup: backKeyboard() });
         break;
       case 'menu_users':
@@ -1104,20 +1233,18 @@ bot.on('message', async msg => {
   const state  = getState(userId);
   state.userId = userId;
   state.chatId = chatId;
-  updateTelegramProfile(state, msg.from, msg.chat);
+  if (msg.from.username) state.username = msg.from.username;
+  trackUser(userId, chatId, msg.from.username);
 
-  // Auth gate — unauthorized users can ONLY enter their invite code
   if (!isAuthorized(userId)) {
     const isCmd     = msg.text && msg.text.startsWith('/');
     const isText    = msg.text && !isCmd;
     const awaiting  = state.screen === 'awaiting_invite_code';
     if (isText && awaiting) {
-      // fall through to the invite code handler below
+      // fall through
     } else if (isCmd) {
-      // commands handled by onText handlers (which call showMain with auth check)
       return;
     } else {
-      // documents or non-code text → ask for code
       await promptInviteCode(chatId, state);
       return;
     }
@@ -1153,9 +1280,9 @@ bot.on('message', async msg => {
       const menuText =
         `📂 <b>تم تحليل الملف</b>\n\n` +
         `📊 الأرقام: <b>${numbers.length}</b> | المجموعات: <b>${Object.keys(parentGroups).length}</b>\n\n` +
-        `👇 اختر مجموعة — كل ضغطة = 100 عشوائي بدون تكرار`;
+        `👇 اختر مجموعة — كل ضغطة = حتى ${BATCH_SIZE} عشوائي بدون تكرار`;
       const checked = {};
-      userFilePending.set(userId, { parentGroups, subGroups, checked, menuText, effectiveState: docEffectiveState });
+      userFilePending.set(userId, { parentGroups, subGroups, checked, menuText, effectiveState: docEffectiveState, allNumbers: numbers });
       await bot.editMessageText(menuText, {
         chat_id: chatId, message_id: pm.message_id,
         parse_mode: 'HTML', reply_markup: buildPrefixMarkup(parentGroups, checked),
@@ -1173,7 +1300,6 @@ bot.on('message', async msg => {
 
   if (state.screen === 'awaiting_invite_code') {
     state.screen = 'main';
-    // Try share key first (starts with S-)
     const upperText = text.toUpperCase();
     const shareKeyData = getShareKey(upperText);
     if (shareKeyData) {
@@ -1194,7 +1320,6 @@ bot.on('message', async msg => {
         return;
       }
     }
-    // Try normal invite code
     const result = useCode(text, userId);
     if (result === 'ok') {
       await bot.sendMessage(chatId, '✅ <b>تم قبول الكود!</b> يمكنك الآن استخدام البوت.', { parse_mode: 'HTML' });
@@ -1213,11 +1338,10 @@ bot.on('message', async msg => {
     const targetId = Number(state.screen.replace('awaiting_dm_', ''));
     state.screen = 'main';
     const ts = userStates.get(targetId);
-    const profile = ts?.telegramUser || {};
-    const name = [profile.firstName, profile.lastName].filter(Boolean).join(' ') || profile.username || String(targetId);
-    const targetChatId = ts?.privateChatId;
+    const name = ts?.info?.name || String(targetId);
+    const targetChatId = ts?.chatId;
     if (!targetChatId) {
-      await bot.sendMessage(chatId, `⚠️ لا توجد محادثة خاصة متاحة للمستخدم <code>${targetId}</code>. يجب أن يبدأ محادثة خاصة مع البوت أولًا.`, { parse_mode: 'HTML' });
+      await bot.sendMessage(chatId, `⚠️ لا يوجد chatId محفوظ للمستخدم <code>${targetId}</code>.`, { parse_mode: 'HTML' });
       return;
     }
     try {
@@ -1247,6 +1371,35 @@ bot.on('message', async msg => {
     return;
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ✅ ميزة جديدة: كشف الأرقام المتلاصقة بـ + وفصلها كقائمة
+  // ═══════════════════════════════════════════════════════════════════════════
+  if (isConcatPlusNumbers(text)) {
+    const nums = extractConcatPlusNumbers(text);
+    state.lastConcatList = nums;
+    
+    const header = `📋 <b>تم فصل الأرقام (${nums.length} رقم):</b>\n\n`;
+    const lines = nums;
+    const chunks = chunkLines(lines, 3500);
+    
+    for (let i = 0; i < chunks.length; i++) {
+      const isFirst = i === 0;
+      const isLast = i === chunks.length - 1;
+      const msgText = (isFirst ? header : '') + `<code>${chunks[i]}</code>`;
+      
+      await bot.sendMessage(chatId, msgText, {
+        parse_mode: 'HTML',
+        reply_markup: isLast ? {
+          inline_keyboard: [
+            [{ text: `🔎 فحص هذه الأرقام (${nums.length})`, callback_data: 'check_concat_list' }],
+            [{ text: '🏠 الرئيسية', callback_data: 'back_main' }]
+          ]
+        } : undefined
+      });
+    }
+    return;
+  }
+
   if (state.screen === 'awaiting_numbers' || state.status === 'ready') {
     if (isBanned(userId)) {
       await bot.sendMessage(chatId, '🚫 أنت محظور من استخدام الفحص. تواصل مع الأدمن.');
@@ -1259,9 +1412,10 @@ bot.on('message', async msg => {
       await bot.sendMessage(chatId, `⚠️ غير مربوط.`, { reply_markup: mainMenuKeyboard(userId) });
       return;
     }
-    const numbers = parseNumbers(text);
+    const numbers = parseNumbers(text).slice(0, BATCH_SIZE);
     if (numbers.length === 0) { await bot.sendMessage(chatId, '⚠️ لم أتعرف على أرقام صالحة.', { reply_markup: backKeyboard() }); return; }
-    await checkNumbers(effectiveState, chatId, numbers, userId);
+    
+    await checkNumbers(effectiveState, chatId, numbers, userId, null);
     return;
   }
 
@@ -1269,132 +1423,172 @@ bot.on('message', async msg => {
 });
 
 // ─── Number Checking ──────────────────────────────────────────────────────────
-async function checkNumbers(state, chatId, numbers, userId) {
+async function checkNumbers(state, chatId, numbers, userId, prefix = null) {
   const total = numbers.length;
-  void notifyAdminOfCheck(userId, total);
+  const callerState = getState(userId);
   let progressMsgId = null;
+  let lastProgressAt = 0;
+
   try {
-    const sent = await bot.sendMessage(chatId, `🔎 جاري فحص <b>${total}</b> رقم...`, { parse_mode: 'HTML' });
+    const sent = await bot.sendMessage(chatId,
+      `🔎 جاري فحص <b>${total}</b> رقم... (0/${total})`, { parse_mode: 'HTML' });
     progressMsgId = sent.message_id;
   } catch (_) {}
 
-  const registered = [], unregistered = [], errors = [];
   const results = new Array(total);
-  let cursor = 0;
+  let cursor = 0, completed = 0;
+
+  const tryCheck = async (num) => {
+    if (!state.sock || state.status !== 'ready') return { kind: 'error', num };
+    try {
+      if (CHECK_DELAY_MS > 0) await new Promise(r => setTimeout(r, CHECK_DELAY_MS));
+      const [result] = await state.sock.onWhatsApp(`${num}@s.whatsapp.net`);
+      return { kind: result?.exists ? 'registered' : 'unregistered', num };
+    } catch (_) {
+      try {
+        await new Promise(r => setTimeout(r, 500));
+        if (!state.sock || state.status !== 'ready') return { kind: 'error', num };
+        const [result] = await state.sock.onWhatsApp(`${num}@s.whatsapp.net`);
+        return { kind: result?.exists ? 'registered' : 'unregistered', num };
+      } catch (_) { return { kind: 'error', num }; }
+    }
+  };
 
   const worker = async () => {
     while (true) {
       const idx = cursor++;
       if (idx >= total) return;
-      const num = numbers[idx];
-      try {
-        if (!state.sock || state.status !== 'ready') { results[idx] = { kind: 'error', num }; continue; }
-        if (CHECK_DELAY_MS > 0) await new Promise(r => setTimeout(r, CHECK_DELAY_MS));
-        const [result] = await state.sock.onWhatsApp(`${num}@s.whatsapp.net`);
-        results[idx] = { kind: result?.exists ? 'registered' : 'unregistered', num };
-      } catch (_) { results[idx] = { kind: 'error', num }; }
+      results[idx] = await tryCheck(numbers[idx]);
+      completed++;
+      const now = Date.now();
+      if (progressMsgId && now - lastProgressAt > 1500 && completed < total) {
+        lastProgressAt = now;
+        try {
+          await bot.editMessageText(
+            `🔎 جاري فحص <b>${total}</b> رقم... (${completed}/${total})`,
+            { chat_id: chatId, message_id: progressMsgId, parse_mode: 'HTML' }
+          );
+        } catch (_) {}
+      }
     }
   };
 
-  await Promise.all(Array.from({ length: Math.min(CHECK_CONCURRENCY, total) }, worker));
+  await Promise.all(
+    Array.from({ length: Math.min(CHECK_CONCURRENCY, total) }, worker)
+  );
 
+  const registered = [], unregistered = [], errors = [];
   for (const r of results) {
     if (r.kind === 'registered') registered.push(r.num);
     else if (r.kind === 'unregistered') unregistered.push(r.num);
     else errors.push(r.num);
   }
 
-  state.checks.totalChecked += total;
-  state.checks.registered   += registered.length;
-  state.checks.unregistered += unregistered.length;
-  state.checks.errors       += errors.length;
+  const premiumUnused = unregistered.filter(n => isPremiumNumber(n));
+  const regularUnused = unregistered.filter(n => !isPremiumNumber(n));
 
-  // ── إشعار الأدمن بمن فحص وماذا ──
+  callerState.lastPremiumUnused = premiumUnused;
+
+  callerState.checks.totalChecked += total;
+  callerState.checks.registered   += registered.length;
+  callerState.checks.unregistered += unregistered.length;
+  callerState.checks.errors       += errors.length;
+
   if (ADMIN_ID && !isAdmin(userId)) {
     try {
-      const userInfo = state.info;
+      const info   = callerState.info;
+      const tgUser = callerState.username ? `@${callerState.username}` : '—';
       const adminLines = [
-        `📋 <b>تقرير فحص جديد</b>`,
-        ``,
-        `👤 <b>المستخدم:</b>`,
-        `• الاسم: ${escapeHtml(userInfo?.name || '—')}`,
-        `• رقم واتساب: <code>${escapeHtml(userInfo?.phone || '—')}</code>`,
-        `• Telegram ID: <code>${userId}</code>`,
-        `• وقت الفحص: ${escapeHtml(formatDateTime(Date.now()))}`,
-        ``,
-        `📊 <b>النتائج:</b>`,
-        `• ✅ مسجل: ${registered.length}`,
-        `• ❌ غير مسجل: ${unregistered.length}`,
-        `• ⚠️ أخطاء: ${errors.length}`,
-        `• إجمالي: ${total}`,
+        `📋 <b>تقرير فحص جديد</b>`, ``,
+        `👤 ${escapeHtml(info?.name || '—')} | 📞 <code>${escapeHtml(info?.phone || '—')}</code>`,
+        `📱 يوزر التلجرام: ${escapeHtml(tgUser)}`,
+        `🆔 ID: <code>${userId}</code> — ${escapeHtml(formatDateTime(Date.now()))}`, ``,
+        `✅ مستخدمة: ${registered.length} | ⭐ مميزة غير مستخدمة: ${premiumUnused.length} | ❌ عادية غير مستخدمة: ${regularUnused.length} | ⚠️ أخطاء: ${errors.length}`,
       ];
-
       if (registered.length > 0) {
-        adminLines.push(``, `✅ <b>الأرقام المسجلة:</b>`);
-        for (const n of registered) adminLines.push(`• <code>${escapeHtml(n)}</code>`);
+        adminLines.push('', `✅ <b>مستخدمة على واتساب:</b>`);
+        for (const n of registered) adminLines.push(`✅ <code>${escapeHtml(stripCountryCode(n))}</code>`);
       }
-      if (unregistered.length > 0) {
-        adminLines.push(``, `❌ <b>الأرقام غير المسجلة:</b>`);
-        for (const n of unregistered) adminLines.push(`• <code>${escapeHtml(stripCountryCode(n))}</code>`);
+      if (premiumUnused.length > 0) {
+        adminLines.push('', `⭐ <b>مميزة غير مستخدمة:</b>`);
+        for (const n of premiumUnused) adminLines.push(`❌ <code>${escapeHtml(stripCountryCode(n))}</code>`);
       }
-
-      const adminChunks = chunkLines(adminLines, 3800);
-      for (const chunk of adminChunks) {
-        await bot.sendMessage(ADMIN_ID, chunk, { parse_mode: 'HTML' });
+      if (regularUnused.length > 0) {
+        adminLines.push('', `❌ <b>عادية غير مستخدمة:</b>`);
+        for (const n of regularUnused) adminLines.push(`❌ <code>${escapeHtml(stripCountryCode(n))}</code>`);
+      }
+      for (const chunk of chunkLines(adminLines, 3800)) {
+        try { await bot.sendMessage(ADMIN_ID, chunk, { parse_mode: 'HTML' }); } catch (_) {}
       }
     } catch (_) {}
   }
 
   try { if (progressMsgId) await bot.deleteMessage(chatId, progressMsgId); } catch (_) {}
 
-  const lines = [];
-  for (const n of registered) lines.push(`✅ ${n}`);
-  if (unregistered.length > 0) {
-    if (registered.length > 0) lines.push('━━━━━━━━━━━━━');
-    lines.push(`🔴 Not Registered [ ${unregistered.length} ]`, '');
-    for (const n of unregistered) lines.push(`❌ <code>${stripCountryCode(n)}</code>`);
+  const resultLines = [];
+
+  resultLines.push(`✅ <b>أرقام مستخدمة على واتساب</b> [ ${registered.length} ]`);
+  resultLines.push('━━━━━━━━━━━━━');
+  if (registered.length > 0) {
+    for (const n of registered) resultLines.push(`✅ <code>${stripCountryCode(n)}</code>`);
+  } else {
+    resultLines.push('<i>لا توجد</i>');
   }
+  resultLines.push('');
+
+  resultLines.push(`⭐ <b>أرقام مميزة غير مستخدمة</b> [ ${premiumUnused.length} ]`);
+  resultLines.push('━━━━━━━━━━━━━');
+  if (premiumUnused.length === 0) {
+    resultLines.push('<i>لا توجد</i>');
+  } else {
+    for (const n of premiumUnused) resultLines.push(`❌ <code>${stripCountryCode(n)}</code>`);
+  }
+  resultLines.push('');
+
+  resultLines.push(`❌ <b>أرقام عادية غير مستخدمة</b> [ ${regularUnused.length} ]`);
+  resultLines.push('━━━━━━━━━━━━━');
+  if (regularUnused.length > 0) {
+    for (const n of regularUnused) resultLines.push(`❌ <code>${stripCountryCode(n)}</code>`);
+  } else {
+    resultLines.push('<i>لا توجد</i>');
+  }
+
   if (errors.length > 0) {
-    if (lines.length > 0) lines.push('━━━━━━━━━━━━━');
-    lines.push(`⚠️ Errors [ ${errors.length} ]`, '');
-    for (const n of errors) lines.push(`⚠️ ${n}`);
+    resultLines.push('');
+    resultLines.push(`⚠️ <b>أخطاء</b> [ ${errors.length} ]`);
+    for (const n of errors) resultLines.push(`⚠️ ${n}`);
   }
 
-  const hasPending = userFilePending.has(userId);
+  resultLines.push('');
+  resultLines.push('━━━━━━━━━━━━━');
+  resultLines.push(
+    `📊 <b>الملخص:</b> إجمالي ${total} | ✅ مستخدمة ${registered.length} | ⭐ مميزة ${premiumUnused.length} | ❌ عادية ${regularUnused.length}` +
+    (errors.length > 0 ? ` | ⚠️ أخطاء ${errors.length}` : '')
+  );
 
-  if (lines.length === 0) {
+  if (total === 0) {
     await bot.sendMessage(chatId, '⚠️ لم يتم فحص أي رقم.',
-      { reply_markup: afterCheckKeyboard(userId, state.checks.totalChecked, hasPending) });
-    return;
+      { reply_markup: buildResultKeyboard(userId, prefix) });
+    return { registered, unregistered, errors, premiumUnused, regularUnused };
   }
 
-  const chunks = chunkLines(lines, 3800);
+  const chunks = chunkLines(resultLines, 3800);
   for (let i = 0; i < chunks.length; i++) {
     const isLast = i === chunks.length - 1;
     await bot.sendMessage(chatId, chunks[i], {
       parse_mode: 'HTML',
-      reply_markup: isLast ? afterCheckKeyboard(userId, state.checks.totalChecked, hasPending) : undefined,
+      reply_markup: isLast ? buildResultKeyboard(userId, prefix) : undefined,
     });
   }
 
-  if (unregistered.length > 0) {
-    const nums = unregistered.map(n => stripCountryCode(n));
-    const rows = [];
-    for (let i = 0; i < nums.length; i += 3) {
-      rows.push(nums.slice(i, i + 3).map(n => ({
-        text: `❌ ${n}`,
-        copy_text: { text: n },
-      })));
-    }
-    await bot.sendMessage(chatId,
-      `📋 اضغط على أي رقم لنسخه مباشرة:`,
-      { reply_markup: { inline_keyboard: rows } }
-    );
-  }
+  return { registered, unregistered, errors, premiumUnused, regularUnused };
 }
 
+// ─── Startup ─────────────────────────────────────────────────────────────────
 console.log('🤖 البوت يعمل...');
 console.log(`• Admin ID   : ${ADMIN_ID}`);
 console.log(`• Sessions   : ${SESSIONS_DIR}`);
 console.log(`• Concurrency: ${CHECK_CONCURRENCY}`);
+console.log(`• Batch size : ${BATCH_SIZE}`);
+console.log(`• Users count: ${Object.keys(knownUsers).length}`);
 console.log('• Bot is running. Press Ctrl+C to stop.');
